@@ -1,0 +1,86 @@
+/*
+ * Device tree overlay for Waveshare 5-DSI-TOUCH-A on Orange Pi CM4 (RK3566)
+ *
+ * The Orange Pi CM4 base DTB already has a raspits_panel@45 I2C node
+ * with a pre-wired endpoint graph (dsi1 port@1 <-> panel port).
+ * This overlay re-uses that node — we only swap the compatible string
+ * so our ws_dsi_panel.ko driver matches instead of the RPi panel driver.
+ *
+ * HDMI must stay enabled: disabling it breaks the Rockchip DRM
+ * component framework (VOP endpoints still reference HDMI, and
+ * the component master waits forever for it to bind).
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "rockchip,rk3566";
+
+	/* Re-purpose the RPi panel node for the Waveshare MCU */
+	fragment@0 {
+		target = <&raspits_panel>;
+		__overlay__ {
+			status = "okay";
+			compatible = "waveshare,5inch-dsi-mcu";
+		};
+	};
+
+	/* Disable the FT5426 touch driver (wrong IC for this display) */
+	fragment@1 {
+		target = <&raspits_touch_ft5426>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	/* Enable I2C1 (carries SDA/SCL from the MIPI LCD connector) */
+	fragment@2 {
+		target = <&i2c1>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/* Enable DSI1 with 800 Mbps lane rate */
+	fragment@3 {
+		target = <&dsi1>;
+		__overlay__ {
+			status = "okay";
+			rockchip,lane-rate = <800>;
+		};
+	};
+
+	/* Enable MIPI D-PHY1 — 2 lanes for this panel */
+	fragment@4 {
+		target = <&video_phy1>;
+		__overlay__ {
+			status = "okay";
+			inno,lanes = <2>;
+		};
+	};
+
+	/* Route VOP0 -> DSI1 */
+	fragment@5 {
+		target = <&dsi1_in_vp0>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/* Disable VOP1 -> DSI1 */
+	fragment@6 {
+		target = <&dsi1_in_vp1>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	/* Enable DSI1 boot route so DRM picks it up */
+	fragment@7 {
+		target = <&route_dsi1>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+};
