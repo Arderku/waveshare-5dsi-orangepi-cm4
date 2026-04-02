@@ -2,7 +2,7 @@
 
 Get the [Waveshare 5-DSI-TOUCH-A](https://www.waveshare.com/wiki/5-DSI-TOUCH-A) touchscreen working on the **Orange Pi CM4** (Rockchip RK3566).
 
-Waveshare only provides drivers for Raspberry Pi and ESP32. This repo contains a custom Linux kernel module, device tree overlay, and all the config files you need to use this display on the Orange Pi CM4 running Debian.
+Waveshare only provides drivers for Raspberry Pi and ESP32. This repo contains a custom Linux kernel module, device tree overlay, userspace touch polling library, and all the config files you need to use this display (including touch) on the Orange Pi CM4 running Debian.
 
 ### Demo
 
@@ -16,13 +16,14 @@ Waveshare only provides drivers for Raspberry Pi and ESP32. This repo contains a
 | `overlay/` | Device tree overlay that wires up DSI, I2C, and the display |
 | `xorg/` | Xorg config for the modesetting driver |
 | `scripts/` | Install script, overlay merge helper, backlight control tool |
+| `touch/` | Userspace I2C touch polling library for the GT911 |
 
 ## About the display
 
 The [Waveshare 5-DSI-TOUCH-A](https://www.waveshare.com/wiki/5-DSI-TOUCH-A) is a 5-inch 720x1280 IPS touchscreen that connects over a single 22-pin FPC cable carrying MIPI DSI (video), I2C (control + touch), and power.
 
 - **Panel IC**: HX8394 (driven over 2-lane MIPI DSI)
-- **Touch IC**: GT911 / Goodix (handled by the standard Linux Goodix driver)
+- **Touch IC**: GT911 / Goodix (requires userspace I2C polling on Orange Pi CM4 — see `touch/`)
 - **Onboard MCU**: Sits at I2C address `0x45`, controls backlight and panel power
 - **Native orientation**: Portrait (720x1280) -- use `xrandr` to rotate to landscape
 
@@ -147,6 +148,31 @@ sudo cp scripts/ws-backlight.sh /mnt/rootfs/usr/local/bin/
 sudo chmod +x /mnt/rootfs/usr/local/bin/ws-backlight.sh
 ```
 
+**4f) Enable touch (userspace I2C polling):**
+
+Disable the kernel Goodix driver so your application can poll the GT911 directly (see the "Touch input" section below for full details):
+
+```bash
+# Decompile the DTB you merged the overlay into
+dtc -I dtb -O dts -o /tmp/cm4.dts /mnt/sdboot/dtb/rockchip/rk3566-orangepi-cm4.dtb
+
+# Edit /tmp/cm4.dts: find gt911@5d and set status = "disabled"
+# Then recompile:
+dtc -I dts -O dtb -o /mnt/sdboot/dtb/rockchip/rk3566-orangepi-cm4.dtb /tmp/cm4.dts
+```
+
+Set up I2C permissions for non-root users:
+
+```bash
+echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | \
+    sudo tee /mnt/rootfs/etc/udev/rules.d/99-i2c.rules
+
+# Add your user to the i2c group (replace 'youruser')
+sudo chroot /mnt/rootfs usermod -aG i2c youruser
+```
+
+Copy the touch library into your project and integrate `gt911_init()` / `gt911_poll_sdl()` into your main loop. See `touch/` for the source.
+
 ### Step 5 -- Boot it up
 
 ```bash
@@ -224,14 +250,23 @@ If you get symbol errors, your DTB might not have the expected nodes. This overl
 
 ### Touch doesn't work
 
-Touch is handled by the standard Goodix kernel driver (not this module). Check:
+The GT911 touch IC is at I2C address `0x5D` (or `0x14` depending on INT pin state at reset). The standard Linux Goodix kernel driver will probe the chip successfully, but **on the Orange Pi CM4 the interrupt line (GPIO0_A5) is not physically connected to the GT911's INT pin**. This means the driver loads and registers an input device, but no touch events are ever delivered because the IRQ never fires.
+
+**Solution: Userspace I2C polling.** Instead of relying on the broken kernel IRQ path, poll the GT911's touch registers directly over I2C. See `touch/` for the implementation.
+
+Verify the GT911 is detected:
 
 ```bash
 dmesg | grep -i goodix
-ls /dev/input/event*
+# Should show: Goodix-TS 1-005d: ID 911, version: 1060
 ```
 
-The GT911 can show up at I2C address `0x14` or `0x5D` depending on the INT pin state at reset.
+If you need to test raw I2C communication:
+
+```bash
+# Read product ID (should return "911")
+i2cget -f -y 1 0x5d 0x81 0x40 i 4
+```
 
 ### Desktop is black but console works fine
 
@@ -268,6 +303,165 @@ If you're trying to get a similar display working on a Rockchip board, these mig
 7. **Avoid `FlipFB` in Xorg.** `Option "FlipFB" "always"` causes CRTC flip timeouts on DSI displays. Just don't use it.
 
 8. **Xorg's `Rotate` option is ignored.** The Rockchip modesetting driver doesn't support it. Use `xrandr` for rotation.
+
+9. **The GT911 touch IRQ is not wired on Orange Pi CM4.** The 22-pin FPC cable carries I2C for both the MCU and the GT911, but the interrupt line expected by the Goodix kernel driver is not connected. The driver loads, probes the chip, reports its ID — but never delivers events. The fix is to disable the kernel driver and poll the GT911's status register (`0x814E`) from userspace at ~60 Hz.
+
+10. **GT911 coordinate byte order can vary.** The Goodix datasheet says little-endian, but on this hardware the raw bytes at `0x8150` are big-endian. If touch works but reports the same coordinate everywhere, try swapping the byte order.
+
+11. **GT911 requires I2C repeated-start.** Simple separate write-then-read calls over I2C don't work for register access. You must use `ioctl(fd, I2C_RDWR, ...)` with a two-message transaction (write register address + read data in one operation).
+
+## Touch input (GT911 via userspace I2C polling)
+
+The GT911 touch controller shares the same I2C bus (I2C1) as the display MCU (`0x45`). On the Raspberry Pi, the Goodix kernel driver handles touch via an interrupt-driven flow. On the Orange Pi CM4, the interrupt GPIO is not wired to the GT911's INT pin through the 22-pin FPC cable, so the kernel driver loads but never delivers any touch events.
+
+The solution is to **disable the kernel driver** and **poll the GT911 directly from userspace** over `/dev/i2c-1`.
+
+### How it works
+
+1. Open `/dev/i2c-1`
+2. Read the status register (`0x814E`) at ~60 Hz
+3. When bit 7 is set and touch count > 0, read the first touch point from `0x8150`
+4. Convert raw coordinates to screen coordinates (accounting for display rotation)
+5. Push the result as an `SDL_MOUSEBUTTONDOWN`/`UP` event (or inject via `uinput`)
+6. Clear the status register by writing `0x00` to `0x814E`
+
+### GT911 register map (touch-relevant)
+
+| Register | Length | Description |
+|----------|--------|-------------|
+| `0x8140` | 4 bytes | Product ID (ASCII `"911\0"`) |
+| `0x8146` | 4 bytes | X resolution (2 bytes LE) + Y resolution (2 bytes LE) |
+| `0x814E` | 1 byte | Status: bit 7 = data ready, bits 3:0 = touch count |
+| `0x8150` | 8 bytes | Touch point 1: track ID, X (2 bytes), Y (2 bytes), size (2 bytes), reserved |
+
+### Coordinate byte order
+
+**On this specific hardware, the GT911 sends coordinates in big-endian format**, even though the Goodix datasheet describes little-endian. The raw point data at `0x8150` is:
+
+```
+pt[0] = track ID
+pt[1] = X high byte    ← (pt[1] << 8) | pt[2] = X
+pt[2] = X low byte
+pt[3] = Y high byte    ← (pt[3] << 8) | pt[4] = Y
+pt[4] = Y low byte
+pt[5..7] = size + reserved
+```
+
+If your coordinates are stuck at `(1279, 0)` or `(719, 0)` regardless of where you tap, you likely have the byte order wrong.
+
+### I2C access method
+
+The GT911 requires **I2C repeated-start** (combined write-then-read) transactions for register access. A simple `write()` followed by `read()` does not work — the GT911 ignores the second transaction. Use `ioctl(fd, I2C_RDWR, ...)` with a two-message `i2c_rdwr_ioctl_data`:
+
+```c
+static int gt911_read_reg(int fd, uint16_t reg, uint8_t *data, int len)
+{
+    uint8_t addr[2] = { (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF) };
+    struct i2c_msg msgs[2] = {
+        { .addr = 0x5D, .flags = 0,        .len = 2,   .buf = addr },
+        { .addr = 0x5D, .flags = I2C_M_RD, .len = len, .buf = data },
+    };
+    struct i2c_rdwr_ioctl_data rdwr = { .msgs = msgs, .nmsgs = 2 };
+    return ioctl(fd, I2C_RDWR, &rdwr) < 0 ? -1 : 0;
+}
+```
+
+### Disabling the kernel Goodix driver
+
+If the kernel Goodix driver is bound to the GT911, userspace I2C access will fail with `EBUSY`. You must disable the kernel driver by setting `status = "disabled"` on the `gt911@5d` node in the device tree.
+
+Decompile the DTB, patch, and recompile:
+
+```bash
+dtc -I dtb -O dts -o cm4.dts rk3566-orangepi-cm4.dtb
+```
+
+Find the `gt911@5d` node and change:
+
+```dts
+gt911@5d {
+    status = "disabled";   /* was "okay" */
+    /* ... rest of the node stays the same ... */
+};
+```
+
+Recompile:
+
+```bash
+dtc -I dts -O dtb -o rk3566-orangepi-cm4.dtb cm4.dts
+```
+
+### I2C permissions for non-root users
+
+If your application runs as a non-root user, you need a udev rule:
+
+```bash
+# /etc/udev/rules.d/99-i2c.rules
+KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"
+```
+
+And add your user to the `i2c` group:
+
+```bash
+sudo usermod -aG i2c youruser
+```
+
+### Display rotation and coordinate mapping
+
+The display is natively portrait (720x1280) but typically rotated to landscape (1280x720) using `xrandr --rotate right`. This means the raw GT911 coordinates need to be transformed:
+
+```
+screen_x = raw_y
+screen_y = (native_width - 1) - raw_x
+```
+
+Where `native_width` is 720 (the GT911's X resolution as reported in its config at `0x8146`).
+
+### Reference implementation
+
+See `touch/gt911_i2c.c` for a complete working implementation that:
+
+- Initializes the GT911 over `/dev/i2c-1`
+- Reads and logs the product ID and resolution at startup
+- Polls touch data at ~16ms intervals
+- Transforms coordinates for landscape rotation
+- Pushes `SDL_MOUSEBUTTONDOWN`, `SDL_MOUSEMOTION`, and `SDL_MOUSEBUTTONUP` events
+
+## Backlight / brightness control
+
+The kernel module (`ws_dsi_panel.ko`) registers a standard Linux backlight device, so brightness is available through `/sys/class/backlight`:
+
+```bash
+# Read current brightness (0–255)
+cat /sys/class/backlight/*/brightness
+
+# Set brightness
+echo 128 | sudo tee /sys/class/backlight/*/brightness
+
+# Read max brightness
+cat /sys/class/backlight/*/max_brightness
+```
+
+This is the recommended way to control brightness from application code — just read/write the sysfs files. No I2C access or unlock sequence needed, the kernel driver handles that.
+
+For quick manual testing or if the kernel driver isn't loaded, the `ws-backlight.sh` script talks to the MCU directly over I2C:
+
+```bash
+ws-backlight.sh 255   # full brightness
+ws-backlight.sh 128   # 50%
+ws-backlight.sh 0     # off
+```
+
+### Backlight permissions for non-root users
+
+To let a non-root user write to the sysfs brightness file, add a udev rule:
+
+```bash
+# /etc/udev/rules.d/99-backlight.rules
+SUBSYSTEM=="backlight", ACTION=="add", RUN+="/bin/chmod 0666 /sys/class/backlight/%k/brightness"
+```
+
+Or grant write access to a specific group and add your user to it.
 
 ## Technical reference
 
